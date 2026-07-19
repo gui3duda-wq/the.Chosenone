@@ -1,0 +1,153 @@
+export const runtime = 'nodejs'
+
+import fs from 'fs'
+import path from 'path'
+import { execSync } from 'child_process'
+
+/**
+ * Ensure the SQLite database file exists and has the correct schema.
+ * Runs prisma db push if the file is missing or empty.
+ */
+async function ensureDatabase() {
+  const dbUrl = process.env.DATABASE_URL || ''
+  if (!dbUrl.startsWith('file:')) {
+    console.log('[instrumentation] DATABASE_URL não é file: — pulando criação de banco')
+    return
+  }
+  const dbPath = dbUrl.replace('file:', '')
+  const dir = path.dirname(dbPath)
+
+  // Ensure directory exists
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  } catch (e) {
+    console.error('[instrumentation] Erro ao criar diretório do banco:', e)
+  }
+
+  // If DB file doesn't exist, run prisma db push to create it with schema
+  if (!fs.existsSync(dbPath)) {
+    console.log(`[instrumentation] Banco não existe em ${dbPath} — criando com prisma db push...`)
+    try {
+      execSync(`DATABASE_URL="${dbUrl}" bunx prisma db push --skip-generate`, {
+        stdio: 'pipe',
+        cwd: process.cwd(),
+        timeout: 30000,
+      })
+      console.log('[instrumentation] Banco criado com sucesso')
+    } catch (e) {
+      console.error('[instrumentation] Erro ao criar banco:', e)
+    }
+  }
+}
+
+export async function register() {
+  if (typeof window !== 'undefined') return
+
+  try {
+    console.log('[instrumentation] Iniciando verificação do banco...')
+
+    // 1. Ensure database file + schema exist
+    await ensureDatabase()
+
+    // 2. Now import db (after DATABASE_URL is set)
+    const { db } = await import('./lib/db')
+    const { hashPassword } = await import('./lib/auth')
+
+    console.log('[instrumentation] Verificando integridade do banco...')
+
+    // 3. Always ensure at least one admin exists
+    const adminCount = await db.admin.count().catch(() => 0)
+    if (adminCount === 0) {
+      console.log('[instrumentation] Criando admin padrão (admin/admin123)')
+      await db.admin.create({ data: { username: 'admin', password: hashPassword('admin123') } }).catch(() => {})
+    }
+
+    // 4. If products or settings are missing, restore from backup
+    const productCount = await db.product.count().catch(() => 0)
+    const settingCount = await db.siteSetting.count().catch(() => 0)
+
+    if (productCount === 0 || settingCount === 0) {
+      const backupFile = path.join(process.cwd(), 'db', 'backup.json')
+      const historyDir = path.join(process.cwd(), 'db', 'backups')
+
+      type Snapshot = {
+        exportedAt?: string
+        admin?: { username: string; password: string } | null
+        settings?: Array<{ key: string; value: string }>
+        products?: Array<{
+          name: string; description: string; price: number; image: string
+          images?: string; sizes: string; category?: string
+          featured?: boolean; inStock?: boolean
+        }>
+      }
+      let snapshot: Snapshot | null = null
+
+      if (fs.existsSync(backupFile)) {
+        try { snapshot = JSON.parse(fs.readFileSync(backupFile, 'utf-8')) } catch {}
+      }
+      if (!snapshot && fs.existsSync(historyDir)) {
+        const files = fs.readdirSync(historyDir)
+          .filter(f => f.startsWith('backup-') && f.endsWith('.json'))
+          .map(f => ({ name: f, mtime: fs.statSync(path.join(historyDir, f)).mtime.getTime() }))
+          .sort((a, b) => b.mtime - a.mtime)
+        for (const f of files) {
+          try {
+            snapshot = JSON.parse(fs.readFileSync(path.join(historyDir, f.name), 'utf-8'))
+            if (snapshot) break
+          } catch {}
+        }
+      }
+
+      if (snapshot) {
+        console.log('[instrumentation] Restaurando do backup...')
+        if (settingCount === 0 && Array.isArray(snapshot.settings)) {
+          for (const s of snapshot.settings) {
+            await db.siteSetting.create({ data: { key: s.key, value: String(s.value) } }).catch(() => {})
+          }
+        }
+        if (productCount === 0 && Array.isArray(snapshot.products)) {
+          for (const p of snapshot.products) {
+            try {
+              await db.product.create({
+                data: {
+                  name: p.name, description: p.description, price: Number(p.price),
+                  image: p.image, images: p.images || '', sizes: p.sizes,
+                  category: p.category || 'Coleção', featured: !!p.featured, inStock: p.inStock !== false,
+                },
+              })
+            } catch {}
+          }
+        }
+        if (snapshot.admin?.password && adminCount === 0) {
+          await db.admin.update({ where: { username: 'admin' }, data: { password: snapshot.admin.password } }).catch(() => {})
+        }
+      } else {
+        console.log('[instrumentation] Sem backup — criando dados mínimos')
+        if (settingCount === 0) {
+          const defaults = [
+            { key: 'storeName', value: 'CHOSEN ONE' },
+            { key: 'storeTagline', value: 'O escolhido não erra. Apenas decide.' },
+            { key: 'heroTitle', value: 'SEJA O\nESCOLHIDO.' },
+            { key: 'heroSubtitle', value: 'Streetwear para quem não pede licença.' },
+            { key: 'heroBadge', value: 'COLEÇÃO 01 — DESTINO' },
+            { key: 'whatsappNumber', value: '5511999999999' },
+            { key: 'whatsappMessage', value: 'Olá! Tenho interesse na peça {product} (Tam: {size}) — valor R$ {price}.' },
+            { key: 'contactEmail', value: 'contato@chosenone.com.br' },
+            { key: 'contactInstagram', value: '@chosenone' },
+            { key: 'footerText', value: 'CHOSEN ONE — Nascidos para ser escolhidos.' },
+            { key: 'logoImage', value: '/uploads/co-logo-red.png' },
+            { key: 'marqueeText', value: 'CHOSEN ONE • O ESCOLHIDO NÃO ERRA •' },
+          ]
+          for (const s of defaults) {
+            await db.siteSetting.create({ data: s }).catch(() => {})
+          }
+        }
+      }
+    }
+
+    console.log('[instrumentation] Banco íntegro — servidor pronto')
+  } catch (e) {
+    console.error('[instrumentation] Erro:', e)
+    // Don't crash — let the server start anyway
+  }
+}
